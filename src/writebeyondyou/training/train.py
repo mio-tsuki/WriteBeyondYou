@@ -7,6 +7,7 @@ import os
 import random
 import tempfile
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -218,7 +219,10 @@ def train(
             dataset,
             batch_sampler=batch_sampler,
             num_workers=workers,
-            collate_fn=collate_handwriting,
+            collate_fn=partial(
+                collate_handwriting,
+                pack_style=selected_device.type == "tpu" and isinstance(model, HandwritingModel),
+            ),
             persistent_workers=False,
             generator=torch.Generator().manual_seed(seed + epoch),
         )

@@ -44,13 +44,14 @@ Run the training entry point and save checkpoints to Drive:
 ```bash
 cd /content/WriteBeyondYou
 python -m pip install -e .
-python -m writebeyondyou.training.train --device tpu --batch-size 128 \
+python -m writebeyondyou.training.train --device tpu --batch-size 384 \
   --max-steps 200 --checkpoint-every 20 \
   --checkpoint-dir /content/drive/MyDrive/wby/checkpoints/v5e1
 ```
 
-Batch size 128 was tested on v5e-1 with style and target sequences padded to 192
-steps. Longer sequences use more device memory.
+Batch size 384 was tested on v5e-1 with target sequences padded to 192 steps.
+TPU training groups style strokes by length and packs their valid encoder outputs
+for attention. Longer target sequences or packed style memories use more device memory.
 
 To continue after an interruption, repeat the command with `--resume` and raise
 `--max-steps` to the desired total. Keep the dataset and seed the same. To change the

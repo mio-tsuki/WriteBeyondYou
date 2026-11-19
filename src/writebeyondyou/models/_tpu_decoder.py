@@ -27,6 +27,9 @@ def teacher_forcing_scan_jax(
     content_score_bias: Any,
     content_layer_weight: Any,
     style_layer_weight: Any,
+    style_score_offset: Any | None = None,
+    style_context_offset: Any | None = None,
+    return_style_aux: bool = False,
 ) -> Any:
     """Run the existing decoder recurrence with one compiled ``lax.scan``.
 
@@ -44,8 +47,13 @@ def teacher_forcing_scan_jax(
         style_lengths.shape[0], style_count * style_steps
     )
     content_mask = content_positions[None, :] < content_lengths[:, None]
+    use_style_offsets = style_score_offset is not None
 
-    def step(carry: tuple[Any, Any, Any, Any], stroke: Any):
+    def step(carry: tuple[Any, Any, Any, Any], scan_input: Any):
+        if use_style_offsets:
+            stroke, score_delta, context_delta = scan_input
+        else:
+            stroke = scan_input
         attention, h, c, previous_alignment = carry
         x = jnp.concatenate((stroke, attention), axis=-1)
         gates = x @ lstm_weight_ih.T + lstm_bias_ih
@@ -80,23 +88,31 @@ def teacher_forcing_scan_jax(
         )
 
         style_scores = jnp.einsum("bsh,bh->bs", style_keys, h)
+        if use_style_offsets:
+            style_scores = style_scores + score_delta
         style_scores = jnp.where(flat_style_mask, style_scores, -jnp.inf)
         style_weights = jax.nn.softmax(style_scores.astype(jnp.float32), axis=-1).astype(
             style_memory.dtype
         )
         style_context = jnp.einsum("bs,bsh->bh", style_weights, style_memory)
+        if use_style_offsets:
+            style_context = style_context + context_delta
 
         content_output = jnp.concatenate((h, content_context), axis=-1) @ content_layer_weight.T
         style_output = jnp.concatenate((h, style_context), axis=-1) @ style_layer_weight.T
         attention = jnp.concatenate((content_output, style_output), axis=-1)
-        return (attention, h, c, alignment), attention
+        scan_output = (attention, h, style_weights) if return_style_aux else attention
+        return (attention, h, c, alignment), scan_output
 
-    (_, _, _, _), outputs = jax.lax.scan(
+    (_, _, _, _), scan_outputs = jax.lax.scan(
         step,
         (initial_attention, initial_h, initial_c, initial_alignment),
-        inputs,
+        (inputs, style_score_offset, style_context_offset) if use_style_offsets else inputs,
     )
-    return outputs
+    if return_style_aux:
+        outputs, queries, weights = scan_outputs
+        return outputs, (queries, weights)
+    return scan_outputs
 
 
 _torch_decoder_op: Any | None = None
@@ -108,6 +124,8 @@ def _get_torch_decoder_op() -> Any:
     if _torch_decoder_op is not None:
         return _torch_decoder_op
 
+    import jax
+    import jax.numpy as jnp
     from jax import Array, vjp
     from torch.library import register_autograd
     from torch.tpu.pallas import jax_op
@@ -152,17 +170,39 @@ def _get_torch_decoder_op() -> Any:
             v_lstm_weight_ih: Array, v_lstm_weight_hh: Array, v_lstm_bias_ih: Array,
             v_lstm_bias_hh: Array, v_content_score_bias: Array,
             v_content_layer_weight: Array, v_style_layer_weight: Array,
-        ) -> Array:
-            return teacher_forcing_scan_jax(
+            v_style_score_offset: Array, v_style_context_offset: Array,
+        ) -> Any:
+            outputs, aux = teacher_forcing_scan_jax(
                 v_inputs, v_initial_attention, v_initial_h, v_initial_c,
-                v_content_memory, v_content_keys, content_lengths, v_style_memory,
-                v_style_keys, style_lengths, v_initial_alignment, v_lstm_weight_ih,
+                v_content_memory, v_content_keys, content_lengths,
+                jax.lax.stop_gradient(v_style_memory),
+                jax.lax.stop_gradient(v_style_keys), style_lengths,
+                v_initial_alignment, v_lstm_weight_ih,
                 v_lstm_weight_hh, v_lstm_bias_ih, v_lstm_bias_hh,
                 v_content_score_bias, v_content_layer_weight, v_style_layer_weight,
+                v_style_score_offset, v_style_context_offset,
+                return_style_aux=True,
             )
+            return outputs, aux
 
-        _, pullback = vjp(floating_compute, *floating)
-        return pullback(output_gradient)
+        time, batch, _ = inputs.shape
+        score_offset = jnp.zeros((time, batch, style_memory.shape[1]), dtype=style_memory.dtype)
+        context_offset = jnp.zeros((time, batch, style_memory.shape[-1]), dtype=style_memory.dtype)
+        _, pullback, (queries, weights) = vjp(
+            floating_compute, *floating, score_offset, context_offset, has_aux=True
+        )
+        all_gradients = pullback(output_gradient)
+        gradients = all_gradients[:len(floating)]
+        grad_scores, grad_context = all_gradients[-2:]
+
+        # Accumulate the sequence-wide style-memory gradients after the scan.
+        # This keeps the large [B, S, H] reductions out of every scan step.
+        grad_style_keys = jnp.einsum("tbs,tbh->bsh", grad_scores, queries)
+        grad_style_memory = jnp.einsum("tbh,tbs->bsh", grad_context, weights)
+        gradients = list(gradients)
+        gradients[6] = grad_style_memory
+        gradients[7] = grad_style_keys
+        return tuple(gradients)
 
     def setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
         ctx.save_for_backward(*inputs)

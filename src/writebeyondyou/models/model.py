@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+from ..data.bucket import BUCKETS
 from ..data.targets import prepare_targets
 from .decoder import AttentionDecoder
 from .encoder import BiLSTMEncoder
@@ -19,10 +20,7 @@ class HandwritingModel(nn.Module):
     def forward(self, batch: dict[str, torch.Tensor]):
         # Normalize coordinates without modifying the original batch.
         content = batch["content"].clone()
-        style = batch["style"].clone()
-
         content[..., :2] /= 200.0
-        style[..., :2] /= 200.0
 
         # Content encoder.
         content_memory, content_last = self.content_encoder(
@@ -31,19 +29,31 @@ class HandwritingModel(nn.Module):
         )
 
         # Style encoder: [B, N, T, 3] -> [B*N, T, 3].
-        B, N, T, _ = style.shape
-
-        style_memory, _ = self.style_encoder(
-            style.flatten(0, 1),
-            batch["style_lengths"].flatten(),
-        )
-
-        style_memory = style_memory.reshape(B, N, T, -1)
+        B, N, T, _ = batch["style"].shape
+        style_attention_lengths = batch["style_lengths"]
+        if content.device.type == "tpu" and "style_attention_indices" in batch:
+            banks = []
+            for steps in BUCKETS:
+                key = f"style_bucket_{steps}"
+                if key in batch:
+                    style = batch[key].clone()
+                    style[..., :2] /= 200.0
+                    memory, _ = self.style_encoder(style, batch[f"{key}_lengths"])
+                    banks.append(memory.flatten(0, 1))
+            indices = batch["style_attention_indices"]
+            bank = torch.cat(banks, dim=0)
+            style_memory = bank.index_select(0, indices.flatten()).reshape(B, indices.size(1), -1)
+            style_attention_lengths = batch["style_attention_lengths"]
+        else:
+            style = batch["style"].clone()
+            style[..., :2] /= 200.0
+            style_memory, _ = self.style_encoder(
+                style.flatten(0, 1), batch["style_lengths"].flatten()
+            )
+            style_memory = style_memory.reshape(B, N * T, -1)
 
         content_keys = self.decoder.content_attention.key(content_memory)
-        style_keys = self.decoder.style_attention.key(
-            style_memory.reshape(B, N * T, -1)
-        )
+        style_keys = self.decoder.style_attention.key(style_memory)
 
         # Teacher-forcing inputs and targets.
         inputs, xy, pen, xy_mask, pen_mask = prepare_targets(
@@ -76,9 +86,9 @@ class HandwritingModel(nn.Module):
                 content_memory,
                 content_keys,
                 batch["content_lengths"].to(dtype=torch.int32),
-                style_memory.flatten(1, 2),
+                style_memory,
                 style_keys,
-                batch["style_lengths"].to(dtype=torch.int32),
+                style_attention_lengths.to(dtype=torch.int32),
                 alignment,
                 lstm.weight_ih,
                 lstm.weight_hh,
@@ -89,6 +99,7 @@ class HandwritingModel(nn.Module):
                 self.decoder.style_layer.weight,
             ).transpose(0, 1)
         else:
+            style_memory = style_memory.reshape(B, N, T, -1)
             outputs = []
             for t in range(inputs.size(1)):
                 attention, state, alignment, _ = self.decoder(
