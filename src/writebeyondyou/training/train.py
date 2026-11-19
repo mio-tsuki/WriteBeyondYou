@@ -73,10 +73,7 @@ def _to_cpu(value: Any) -> Any:
 def _synchronize(device: torch.device) -> None:
     """Wait for an asynchronous accelerator before logging or checkpointing."""
     if device.type == "tpu":
-        tpu_api = getattr(torch, "tpu", None)
-        synchronize = getattr(tpu_api, "synchronize", None)
-        if callable(synchronize):
-            synchronize()
+        torch.accelerator.synchronize(device)
 
 
 def _select_device(requested: str) -> torch.device:

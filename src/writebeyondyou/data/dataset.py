@@ -1,5 +1,5 @@
 import random
-from itertools import groupby
+from itertools import chain, groupby
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +35,11 @@ class HandwritingDataset(Dataset):
 
         start = 0
 
-        for writer_id, group in groupby(self.handwriting["writer_id"]):
+        # Decode Arrow chunks in bulk while scanning the contiguous writer ranges.
+        writer_ids = chain.from_iterable(
+            chunk.to_pylist() for chunk in self.handwriting.data.column("writer_id").chunks
+        )
+        for writer_id, group in groupby(writer_ids):
             count = sum(1 for _ in group)
 
             if writer_id in self.writer_ranges:

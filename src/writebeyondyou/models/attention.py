@@ -93,13 +93,34 @@ def monotonic_alignment(
         dim=1,
     )
 
-    carry = p.new_zeros(p.size(0))
-    alignments = []
-    for t in range(p.size(1)):
-        p_i = p[:, t]
-        previous_i = previous[:, t]
-        shifted_i = shifted[:, t]
-        carry = previous_i + (1 - shifted_i) * carry
-        alignments.append(p_i * carry)
+    # Each recurrence step is an affine map f_i(c) = b_i + a_i * c,
+    # where b_i is the previous alignment and a_i is 1 - shifted_i.
+    # Affine-map composition is associative, so a doubling prefix computes
+    # every carry in O(log T) tensor rounds without divisions (including when
+    # a_i is exactly zero).
+    prefix_a = 1 - shifted
+    prefix_b = previous
+    offset = 1
+    steps = p.size(1)
 
-    return torch.stack(alignments, dim=1)
+    while offset < steps:
+        prior_a = prefix_a
+        prior_b = prefix_b
+        prefix_a = torch.cat(
+            (
+                prior_a[:, :offset],
+                prior_a[:, offset:] * prior_a[:, :-offset],
+            ),
+            dim=1,
+        )
+        prefix_b = torch.cat(
+            (
+                prior_b[:, :offset],
+                prior_b[:, offset:]
+                + prior_a[:, offset:] * prior_b[:, :-offset],
+            ),
+            dim=1,
+        )
+        offset *= 2
+
+    return p * prefix_b
