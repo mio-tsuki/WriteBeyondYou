@@ -100,7 +100,7 @@ def monotonic_alignment(
 
     _, alignments = scan(
         step,
-        torch.zeros_like(p[:, 0]),
+        p.new_zeros(p.size(0)),
         (p.T, previous.T, shifted.T),
     )
 
