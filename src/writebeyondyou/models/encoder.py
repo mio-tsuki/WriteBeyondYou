@@ -28,6 +28,8 @@ class BiLSTMEncoder(nn.Module):
         # supported by accelerator graph compilers. Keep a dense, static
         # sequence and hold recurrent state outside each example's true length.
         batch, steps, _ = x.shape
+        if x.device.type == "tpu":
+            lengths = lengths.to(device=x.device, dtype=torch.int32)
         positions = torch.arange(steps, device=x.device)
         valid = positions[:, None] < lengths[None, :]
 
@@ -43,6 +45,22 @@ class BiLSTMEncoder(nn.Module):
                 weight_hh = getattr(self.lstm, f"weight_hh_l{layer}{suffix}")
                 bias_ih = getattr(self.lstm, f"bias_ih_l{layer}{suffix}")
                 bias_hh = getattr(self.lstm, f"bias_hh_l{layer}{suffix}")
+                if x.device.type == "tpu":
+                    from ._tpu_encoder import run_direction
+
+                    output, last_h = run_direction(
+                        layer_input,
+                        lengths,
+                        weight_ih,
+                        weight_hh,
+                        bias_ih,
+                        bias_hh,
+                        reverse=reverse,
+                    )
+                    directions.append(output)
+                    layer_states.append(last_h)
+                    continue
+
                 initial = x.new_zeros(batch, self.lstm.hidden_size)
                 input_gates = torch.nn.functional.linear(
                     layer_input, weight_ih, bias_ih

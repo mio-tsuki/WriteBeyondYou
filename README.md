@@ -13,9 +13,11 @@ uv run python -m writebeyondyou.training.train --device cpu --steps 10
 
 ## Colab TPU training
 
-Select a TPU v5e-1 runtime. Use the matched PyTorch and `torch_tpu` packages supplied by the
-Colab TPU image. The entry point also requires `datasets` and `numpy`, which `pip install -e .`
-installs if the runtime does not already provide compatible versions.
+Select a TPU v5e-1 runtime. Use the PyTorch, `torch_tpu` and JAX packages supplied by
+the Colab TPU image. The compiled recurrent kernels were tested with PyTorch
+2.14.1, `torch_tpu` 0.2.0 and JAX 0.11.2. TorchTPU runs the kernels on the TPU
+and PyTorch manages the gradients, optimizer and checkpoints. CPU training does
+not require JAX.
 
 In a Colab notebook cell, mount Drive and copy the dataset to the runtime's local disk:
 
@@ -42,10 +44,13 @@ Run the training entry point and save checkpoints to Drive:
 ```bash
 cd /content/WriteBeyondYou
 python -m pip install -e .
-python -m writebeyondyou.training.train --device tpu --batch-size 4 \
+python -m writebeyondyou.training.train --device tpu --batch-size 128 \
   --max-steps 200 --checkpoint-every 20 \
   --checkpoint-dir /content/drive/MyDrive/wby/checkpoints/v5e1
 ```
+
+Batch size 128 was tested on v5e-1 with style and target sequences padded to 192
+steps. Longer sequences use more device memory.
 
 To continue after an interruption, repeat the command with `--resume` and raise
 `--max-steps` to the desired total. Keep the dataset and seed the same. To change the

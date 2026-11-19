@@ -61,25 +61,52 @@ class HandwritingModel(nn.Module):
         )
         alignment[:, 0] = 1.0
 
-        # Autoregressive decoder with teacher forcing.
-        outputs = []
-        for t in range(inputs.size(1)):
-            attention, state, alignment, _ = self.decoder(
-                inputs[:, t],
+        # Autoregressive decoder with teacher forcing. TorchTPU's JAX scan
+        # lowers the recurrent sequence as one compiled block; CPU and other
+        # devices retain the eager PyTorch reference path.
+        if content.device.type == "tpu":
+            from ._tpu_decoder import run_tpu_teacher_forcing
+
+            lstm = self.decoder.core.lstm
+            features = run_tpu_teacher_forcing(
+                inputs.transpose(0, 1).contiguous(),
                 attention,
-                state,
+                state[0],
+                state[1],
                 content_memory,
-                batch["content_lengths"],
-                style_memory,
-                batch["style_lengths"],
-                alignment,
                 content_keys,
+                batch["content_lengths"].to(dtype=torch.int32),
+                style_memory.flatten(1, 2),
                 style_keys,
-            )
-            outputs.append(attention)
+                batch["style_lengths"].to(dtype=torch.int32),
+                alignment,
+                lstm.weight_ih,
+                lstm.weight_hh,
+                lstm.bias_ih,
+                lstm.bias_hh,
+                self.decoder.content_attention.score_bias,
+                self.decoder.content_layer.weight,
+                self.decoder.style_layer.weight,
+            ).transpose(0, 1)
+        else:
+            outputs = []
+            for t in range(inputs.size(1)):
+                attention, state, alignment, _ = self.decoder(
+                    inputs[:, t],
+                    attention,
+                    state,
+                    content_memory,
+                    batch["content_lengths"],
+                    style_memory,
+                    batch["style_lengths"],
+                    alignment,
+                    content_keys,
+                    style_keys,
+                )
+                outputs.append(attention)
+            features = torch.stack(outputs, dim=1)
 
         # [B, T+1, 1024] -> GMM parameters.
-        features = torch.stack(outputs, dim=1)
         params = self.head(features)
 
         return handwriting_loss(
