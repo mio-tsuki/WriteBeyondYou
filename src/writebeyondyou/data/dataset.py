@@ -30,6 +30,8 @@ class HandwritingDataset(Dataset):
         }
 
         self.writer_ranges = {}
+        self.sample_seed = 0
+        self.epoch = 0
 
         start = 0
 
@@ -42,6 +44,15 @@ class HandwritingDataset(Dataset):
             self.writer_ranges[writer_id] = (start, start + count)
             start += count
 
+    def set_epoch(self, epoch: int, seed: int) -> None:
+        """Set deterministic per-sample style sampling for this training epoch."""
+        self.epoch = epoch
+        self.sample_seed = seed
+
+    def _style_indices(self, index: int, start: int, end: int) -> list[int]:
+        sample_rng = random.Random(f"{self.sample_seed}:{self.epoch}:{index}")
+        return sample_rng.sample(range(start, end), k=10)
+
 
     def __len__(self) -> int:
         return len(self.handwriting)
@@ -51,10 +62,9 @@ class HandwritingDataset(Dataset):
 
         start, end = self.writer_ranges[target["writer_id"]]
 
-        style_indices = random.sample(
-            range(start, end),
-            k=10,
-        )
+        # Keep the style references random within a writer while making each
+        # (seed, epoch, sample) choice stable across worker counts and resume.
+        style_indices = self._style_indices(index, start, end)
 
         style_rows = self.handwriting[style_indices]["strokes"]
 

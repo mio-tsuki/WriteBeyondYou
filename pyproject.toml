@@ -8,9 +8,9 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "datasets>=5.2.0",
-    "numpy>=2.5.5",
-    "torch>=2.15.0",
+    "datasets>=4.8.5",
+    "numpy>=2.4.6",
+    "torch>=2.14.1",
 ]
 
 [build-system]

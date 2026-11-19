@@ -1,9 +1,5 @@
 import torch
 from torch import nn
-from torch.nn.utils.rnn import (
-    pack_padded_sequence,
-    pad_packed_sequence,
-)
 
 
 class BiLSTMEncoder(nn.Module):
@@ -28,21 +24,52 @@ class BiLSTMEncoder(nn.Module):
         x: torch.Tensor,
         lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        packed = pack_padded_sequence(
-            x,
-            lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
-        )
+        # PackedSequence requires copying lengths to the host and is not
+        # supported by accelerator graph compilers. Keep a dense, static
+        # sequence and hold recurrent state outside each example's true length.
+        batch, steps, _ = x.shape
+        positions = torch.arange(steps, device=x.device)
+        valid = positions[:, None] < lengths[None, :]
 
-        packed_output, (h, _) = self.lstm(packed)
+        layer_input = x.transpose(0, 1)
+        final_states = []
 
-        all_h, _ = pad_packed_sequence(
-            packed_output,
-            batch_first=True,
-            total_length=x.size(1),
-        )
+        for layer in range(self.lstm.num_layers):
+            directions = []
+            layer_states = []
+            for reverse in (False, True):
+                suffix = "_reverse" if reverse else ""
+                weight_ih = getattr(self.lstm, f"weight_ih_l{layer}{suffix}")
+                weight_hh = getattr(self.lstm, f"weight_hh_l{layer}{suffix}")
+                bias_ih = getattr(self.lstm, f"bias_ih_l{layer}{suffix}")
+                bias_hh = getattr(self.lstm, f"bias_hh_l{layer}{suffix}")
+                initial = x.new_zeros(batch, self.lstm.hidden_size)
 
-        last_h = torch.cat((h[-2], h[-1]), dim=-1)
+                def cell(h, c, value):
+                    gates = torch.nn.functional.linear(value, weight_ih, bias_ih)
+                    gates = gates + torch.nn.functional.linear(h, weight_hh, bias_hh)
+                    i, f, g, o = gates.chunk(4, dim=-1)
+                    next_c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+                    next_h = torch.sigmoid(o) * torch.tanh(next_c)
+                    return next_h, next_c
 
+                h = c = initial
+                output_steps = [None] * steps
+                indices = range(steps - 1, -1, -1) if reverse else range(steps)
+                for t in indices:
+                    h_candidate, c_candidate = cell(h, c, layer_input[t])
+                    mask = valid[t, :, None]
+                    h = torch.where(mask, h_candidate, h)
+                    c = torch.where(mask, c_candidate, c)
+                    output_steps[t] = torch.where(mask, h, torch.zeros_like(h))
+                output = torch.stack(output_steps, dim=0)
+                last_h = h
+                directions.append(output)
+                layer_states.append(last_h)
+
+            layer_input = torch.cat(directions, dim=-1)
+            final_states = layer_states
+
+        all_h = layer_input.transpose(0, 1)
+        last_h = torch.cat(final_states, dim=-1)
         return all_h, last_h

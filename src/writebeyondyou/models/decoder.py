@@ -61,15 +61,18 @@ class AttentionDecoder(nn.Module):
         style_memory: torch.Tensor,
         style_lengths: torch.Tensor,
         previous_alignment: torch.Tensor,
+        content_keys: torch.Tensor | None = None,
+        style_keys: torch.Tensor | None = None,
     ):
         h, c = self.core(stroke, previous_attention, state)
 
         content_context, content_alignment = self.content_attention(
-            h, content_memory, content_lengths, previous_alignment
+            h, content_memory, content_lengths, previous_alignment,
+            keys=content_keys,
         )
 
         style_context, style_weights = self.style_attention(
-            h, style_memory, style_lengths
+            h, style_memory, style_lengths, keys=style_keys
         )
 
         content_output = self.content_layer(

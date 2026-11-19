@@ -1,6 +1,6 @@
 import torch
 
-BUCKETS = (64, 128, 192, 256, 384, 576)
+BUCKETS = (64, 128, 192, 256, 384, 576, 768)
 
 def bucket_size(length: int) -> int:
     for size in BUCKETS:

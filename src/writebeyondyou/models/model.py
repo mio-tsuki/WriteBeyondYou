@@ -40,6 +40,11 @@ class HandwritingModel(nn.Module):
 
         style_memory = style_memory.reshape(B, N, T, -1)
 
+        content_keys = self.decoder.content_attention.key(content_memory)
+        style_keys = self.decoder.style_attention.key(
+            style_memory.reshape(B, N * T, -1)
+        )
+
         # Teacher-forcing inputs and targets.
         inputs, xy, pen, xy_mask, pen_mask = prepare_targets(
             batch["target"],
@@ -58,7 +63,6 @@ class HandwritingModel(nn.Module):
 
         # Autoregressive decoder with teacher forcing.
         outputs = []
-
         for t in range(inputs.size(1)):
             attention, state, alignment, _ = self.decoder(
                 inputs[:, t],
@@ -69,8 +73,9 @@ class HandwritingModel(nn.Module):
                 style_memory,
                 batch["style_lengths"],
                 alignment,
+                content_keys,
+                style_keys,
             )
-
             outputs.append(attention)
 
         # [B, T+1, 1024] -> GMM parameters.
@@ -116,6 +121,11 @@ class HandwritingModel(nn.Module):
         )
         style_memory = style_memory.reshape(B, N, T, -1)
 
+        content_keys = self.decoder.content_attention.key(content_memory)
+        style_keys = self.decoder.style_attention.key(
+            style_memory.reshape(B, N * T, -1)
+        )
+
         state = self.decoder.core.initial_state(content_last)
 
         stroke = content.new_zeros(B, 5)
@@ -139,6 +149,8 @@ class HandwritingModel(nn.Module):
                 style_memory,
                 style_lengths,
                 alignment,
+                content_keys,
+                style_keys,
             )
 
             params = self.head(attention)

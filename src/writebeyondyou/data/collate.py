@@ -1,5 +1,3 @@
-import torch
-
 from .bucket import collate_strokes
 
 

@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from torch._higher_order_ops import scan
 
 
 class StyleLuongAttention(nn.Module):
@@ -13,11 +12,13 @@ class StyleLuongAttention(nn.Module):
         query: torch.Tensor,
         memory: torch.Tensor,
         lengths: torch.Tensor,
+        keys: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, count, steps, hidden = memory.shape
 
         values = memory.reshape(batch, count * steps, hidden)
-        keys = self.key(values)
+        if keys is None:
+            keys = self.key(values)
 
         scores = torch.bmm(
             keys, query.unsqueeze(-1)
@@ -53,8 +54,10 @@ class ContentMonotonicAttention(nn.Module):
         memory: torch.Tensor,
         lengths: torch.Tensor,
         previous: torch.Tensor,
+        keys: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        keys = self.key(memory)
+        if keys is None:
+            keys = self.key(memory)
 
         scores = torch.bmm(
             keys, query.unsqueeze(-1)
@@ -90,18 +93,13 @@ def monotonic_alignment(
         dim=1,
     )
 
-    def step(carry, inputs):
-        p_i, previous_i, shifted_i = inputs
+    carry = p.new_zeros(p.size(0))
+    alignments = []
+    for t in range(p.size(1)):
+        p_i = p[:, t]
+        previous_i = previous[:, t]
+        shifted_i = shifted[:, t]
+        carry = previous_i + (1 - shifted_i) * carry
+        alignments.append(p_i * carry)
 
-        next_carry = previous_i + (1 - shifted_i) * carry
-        alignment = p_i * next_carry
-
-        return next_carry, alignment
-
-    _, alignments = scan(
-        step,
-        p.new_zeros(p.size(0)),
-        (p.T, previous.T, shifted.T),
-    )
-
-    return alignments.T
+    return torch.stack(alignments, dim=1)
