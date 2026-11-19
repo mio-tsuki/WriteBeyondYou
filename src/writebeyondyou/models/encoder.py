@@ -47,6 +47,7 @@ class BiLSTMEncoder(nn.Module):
                 input_gates = torch.nn.functional.linear(
                     layer_input, weight_ih, bias_ih
                 )
+                input_gate_steps = input_gates.unbind(dim=0)
 
                 def cell(h, c, gates):
                     gates = gates + torch.nn.functional.linear(
@@ -61,7 +62,7 @@ class BiLSTMEncoder(nn.Module):
                 output_steps = [None] * steps
                 indices = range(steps - 1, -1, -1) if reverse else range(steps)
                 for t in indices:
-                    h_candidate, c_candidate = cell(h, c, input_gates[t])
+                    h_candidate, c_candidate = cell(h, c, input_gate_steps[t])
                     mask = valid[t, :, None]
                     h = torch.where(mask, h_candidate, h)
                     c = torch.where(mask, c_candidate, c)
