@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -32,9 +33,11 @@ class TinyModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.tensor(0.25))
+        self.seen_samples: list[int] = []
 
     def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
         content = batch["content"][:, 0, 0].mean()
+        self.seen_samples.extend(batch["content"][:, 0, 0].int().tolist())
         target = batch["target"][:, 0, 0].mean()
         prediction = self.weight * content
         xy_loss = (prediction - target).square()
@@ -118,3 +121,95 @@ def test_style_sampling_is_deterministic_per_epoch_and_sample() -> None:
 
     dataset.set_epoch(epoch=4, seed=17)
     assert dataset._style_indices(index=42, start=100, end=130) != first
+
+
+@pytest.mark.parametrize("resumed_batch_size", [16, 32, 64])
+def test_resume_can_resize_batch_without_skipping_or_repeating_samples(
+    tmp_path: Path, resumed_batch_size: int
+) -> None:
+    dataset = TinyDataset(size=160)
+    checkpoint_dir = tmp_path / f"checkpoints-{resumed_batch_size}"
+    initial_model = TinyModel()
+    initial = train(
+        checkpoint_dir=checkpoint_dir,
+        max_steps=2,
+        batch_size=4,
+        device="cpu",
+        checkpoint_every=1,
+        seed=31,
+        dataset=dataset,
+        model=initial_model,
+    )
+
+    permutation = torch.randperm(160, generator=torch.Generator().manual_seed(31)).tolist()
+    assert initial_model.seen_samples == [index + 1 for index in permutation[:8]]
+    state = torch.load(initial["checkpoint"], map_location="cpu", weights_only=False)
+    assert state["samples_in_epoch"] == 8
+    assert state["global_step"] == 2
+
+    with pytest.raises(ValueError, match="batch_size does not match"):
+        train(
+            checkpoint_dir=checkpoint_dir,
+            max_steps=3,
+            batch_size=resumed_batch_size,
+            device="cpu",
+            resume="latest",
+            seed=31,
+            dataset=dataset,
+            model=TinyModel(),
+        )
+
+    dataset.accessed.clear()
+    resumed_model = TinyModel()
+    resumed = train(
+        checkpoint_dir=checkpoint_dir,
+        max_steps=3,
+        batch_size=resumed_batch_size,
+        device="cpu",
+        resume="latest",
+        allow_batch_size_change=True,
+        checkpoint_every=1,
+        seed=31,
+        dataset=dataset,
+        model=resumed_model,
+    )
+    expected = permutation[8 : 8 + resumed_batch_size]
+    assert resumed_model.seen_samples == [index + 1 for index in expected]
+    assert dataset.accessed == expected
+    assert resumed["global_step"] == 3
+    assert resumed["epoch"] == 0
+    assert resumed["batch_in_epoch"] == 3
+    assert resumed["checkpoint"] == initial["checkpoint"]
+    final_state = torch.load(resumed["checkpoint"], map_location="cpu", weights_only=False)
+    assert final_state["samples_in_epoch"] == 8 + len(expected)
+    assert final_state["batch_size"] == resumed_batch_size
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_after_partial_last_batch_starts_next_epoch(tmp_path: Path, legacy: bool) -> None:
+    dataset = TinyDataset(size=5)
+    first = train(
+        checkpoint_dir=tmp_path, max_steps=2, batch_size=4, dataset=dataset, model=TinyModel()
+    )
+    checkpoint = first["checkpoint"]
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    # A periodic checkpoint can capture the cursor before the epoch rolls over.
+    state.update(epoch=0, batch_in_epoch=2, samples_in_epoch=5)
+    if legacy:
+        del state["samples_in_epoch"]
+    torch.save(state, checkpoint)
+
+    dataset.accessed.clear()
+    result = train(
+        checkpoint_dir=tmp_path,
+        max_steps=3,
+        batch_size=2,
+        resume="latest",
+        allow_batch_size_change=True,
+        dataset=dataset,
+        model=TinyModel(),
+    )
+    next_epoch = torch.randperm(5, generator=torch.Generator().manual_seed(1)).tolist()
+    assert dataset.accessed == next_epoch[:2]
+    assert result["epoch"] == 1
+    assert result["batch_in_epoch"] == 1

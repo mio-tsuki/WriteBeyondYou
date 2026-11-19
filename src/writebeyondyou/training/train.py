@@ -93,21 +93,21 @@ class _EpochBatchSampler(Sampler[list[int]]):
     """Deterministic shuffled batches without materializing millions of lists."""
 
     def __init__(
-        self, dataset_size: int, batch_size: int, seed: int, epoch: int, start_batch: int
+        self, dataset_size: int, batch_size: int, seed: int, epoch: int, start_sample: int
     ) -> None:
         generator = torch.Generator().manual_seed(seed + epoch)
         self.order = torch.randperm(dataset_size, generator=generator)
         self.batch_size = batch_size
-        self.start_batch = start_batch
+        self.start_sample = start_sample
 
     def __iter__(self):
-        start = self.start_batch * self.batch_size
+        start = self.start_sample
         for offset in range(start, self.order.numel(), self.batch_size):
             yield self.order[offset : offset + self.batch_size].tolist()
 
     def __len__(self) -> int:
-        total_batches = (self.order.numel() + self.batch_size - 1) // self.batch_size
-        return max(total_batches - self.start_batch, 0)
+        remaining = max(self.order.numel() - self.start_sample, 0)
+        return (remaining + self.batch_size - 1) // self.batch_size
 
 
 def train(
@@ -122,6 +122,7 @@ def train(
     device: str = "cpu",
     workers: int = 0,
     resume: str | Path | None = None,
+    allow_batch_size_change: bool = False,
     checkpoint_every: int = 100,
     log_every: int = 10,
     seed: int = 0,
@@ -155,7 +156,7 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_path = Path(checkpoint) if checkpoint is not None else checkpoint_dir / "latest.pt"
-    global_step, epoch, batch_in_epoch = 0, 0, 0
+    global_step, epoch, batch_in_epoch, samples_in_epoch = 0, 0, 0, 0
 
     if resume is not None:
         resume_path = checkpoint_path if str(resume) == "latest" else Path(resume)
@@ -163,16 +164,22 @@ def train(
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         global_step = int(state.get("global_step", state.get("step", 0)))
+        saved_batch_size = int(state.get("batch_size", batch_size))
         if "epoch" in state and "batch_in_epoch" in state:
             epoch = int(state["epoch"])
             batch_in_epoch = int(state["batch_in_epoch"])
+            legacy_cursor = min(batch_in_epoch * saved_batch_size, len(dataset))
+            samples_in_epoch = int(state.get("samples_in_epoch", legacy_cursor))
         else:
-            batches_per_epoch = (len(dataset) + batch_size - 1) // batch_size
+            batches_per_epoch = (len(dataset) + saved_batch_size - 1) // saved_batch_size
             epoch, batch_in_epoch = divmod(global_step, batches_per_epoch)
+            samples_in_epoch = min(batch_in_epoch * saved_batch_size, len(dataset))
         if state.get("seed", seed) != seed:
             raise ValueError("resume seed does not match checkpoint seed")
-        if state.get("batch_size", batch_size) != batch_size:
+        if saved_batch_size != batch_size and not allow_batch_size_change:
             raise ValueError("resume batch_size does not match checkpoint batch_size")
+        if not 0 <= samples_in_epoch <= len(dataset):
+            raise ValueError("checkpoint samples_in_epoch is outside the dataset")
         if state.get("dataset_size", len(dataset)) != len(dataset):
             raise ValueError("resume dataset size does not match checkpoint dataset size")
         if "rng" in state:
@@ -188,6 +195,7 @@ def train(
                 "step": global_step,
                 "epoch": epoch,
                 "batch_in_epoch": batch_in_epoch,
+                "samples_in_epoch": samples_in_epoch,
                 "seed": seed,
                 "batch_size": batch_size,
                 "dataset_size": len(dataset),
@@ -200,10 +208,11 @@ def train(
     while (max_steps is None or global_step < max_steps) and (epochs is None or epoch < epochs):
         if hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch, seed)
-        batch_sampler = _EpochBatchSampler(len(dataset), batch_size, seed, epoch, batch_in_epoch)
+        batch_sampler = _EpochBatchSampler(len(dataset), batch_size, seed, epoch, samples_in_epoch)
         if len(batch_sampler) == 0:
             epoch += 1
             batch_in_epoch = 0
+            samples_in_epoch = 0
             continue
         loader = DataLoader(
             dataset,
@@ -215,7 +224,6 @@ def train(
         )
         log_started = time.perf_counter()
         last_logged_step = global_step
-        batches_per_epoch = (len(dataset) + batch_size - 1) // batch_size
         for batch in loader:
             batch = {name: value.to(selected_device) for name, value in batch.items()}
             optimizer.zero_grad(set_to_none=True)
@@ -227,9 +235,10 @@ def train(
             optimizer.step()
             global_step += 1
             batch_in_epoch += 1
+            samples_in_epoch += int(batch["target"].size(0))
             if (
                 global_step % log_every == 0
-                or batch_in_epoch == batches_per_epoch
+                or samples_in_epoch >= len(dataset)
                 or (max_steps is not None and global_step >= max_steps)
             ):
                 _synchronize(selected_device)
@@ -248,9 +257,10 @@ def train(
             if max_steps is not None and global_step >= max_steps:
                 break
 
-        if batch_in_epoch >= (len(dataset) + batch_size - 1) // batch_size:
+        if samples_in_epoch >= len(dataset):
             epoch += 1
             batch_in_epoch = 0
+            samples_in_epoch = 0
 
     save_progress()
     print(f"Saved checkpoint: {checkpoint_path}", flush=True)
@@ -275,6 +285,11 @@ def main() -> None:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "tpu"), default="cpu")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--resume", nargs="?", const="latest", default=None)
+    parser.add_argument(
+        "--allow-batch-size-change",
+        action="store_true",
+        help="resume with a different batch size from the next unconsumed sample",
+    )
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -293,6 +308,7 @@ def main() -> None:
             device=args.device,
             workers=args.workers,
             resume=args.resume,
+            allow_batch_size_change=args.allow_batch_size_change,
             checkpoint_every=args.checkpoint_every,
             log_every=args.log_every,
             seed=args.seed,

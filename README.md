@@ -48,6 +48,8 @@ python -m writebeyondyou.training.train --device tpu --batch-size 4 \
 ```
 
 To continue after an interruption, repeat the command with `--resume` and raise
-`--max-steps` to the desired total. Keep the dataset, batch size and seed the same.
+`--max-steps` to the desired total. Keep the dataset and seed the same. To change the
+batch size during resume, pass `--allow-batch-size-change` along with the new
+`--batch-size`. Training continues at the next unconsumed sample.
 `latest.pt` contains the model, optimizer and training progress. For inference, load its
 `model` entry into `HandwritingModel` and call `generate()`.
