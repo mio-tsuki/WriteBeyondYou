@@ -59,3 +59,20 @@ batch size during resume, pass `--allow-batch-size-change` along with the new
 `--batch-size`. Training continues at the next unconsumed sample.
 `latest.pt` contains the model, optimizer and training progress. For inference, load its
 `model` entry into `HandwritingModel` and call `generate()`.
+
+## Multi-chip TPU training
+
+Use a TorchTPU VM with a compatible PyTorch and JAX installation. With the dataset
+in `data/` and the project installed, discover the TPU topology before launching
+the trainer:
+
+```bash
+eval "$(python -m torch.tpu.distributed | sed 's/^/export /')"
+torchrun --nproc_per_node="$WORLD_SIZE" -m writebeyondyou.training.train \
+  --device tpu --epochs 2 --batch-size 2048 --checkpoint-dir checkpoints
+```
+
+`--batch-size` is the global batch size. On eight chips, a full batch of 2048
+contains 256 samples per chip. Rank zero writes `latest.pt`. To resume a
+single-chip run, pass its checkpoint path to `--resume` and add
+`--allow-batch-size-change` if the global batch size changes.

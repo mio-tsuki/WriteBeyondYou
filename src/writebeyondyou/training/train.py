@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from writebeyondyou.data.collate import collate_handwriting
@@ -71,6 +72,13 @@ def _to_cpu(value: Any) -> Any:
     return value
 
 
+def _base_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the checkpoint-stable model behind an optional DDP wrapper."""
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
+
+
 def _synchronize(device: torch.device) -> None:
     """Wait for an asynchronous accelerator before logging or checkpointing."""
     if device.type == "tpu":
@@ -94,17 +102,34 @@ class _EpochBatchSampler(Sampler[list[int]]):
     """Deterministic shuffled batches without materializing millions of lists."""
 
     def __init__(
-        self, dataset_size: int, batch_size: int, seed: int, epoch: int, start_sample: int
+        self,
+        dataset_size: int,
+        batch_size: int,
+        seed: int,
+        epoch: int,
+        start_sample: int,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         generator = torch.Generator().manual_seed(seed + epoch)
         self.order = torch.randperm(dataset_size, generator=generator)
         self.batch_size = batch_size
         self.start_sample = start_sample
+        self.rank = rank
+        self.world_size = world_size
+        self.global_counts: list[int] = []
+        self.local_counts: list[int] = []
 
     def __iter__(self):
         start = self.start_sample
+        self.global_counts.clear()
+        self.local_counts.clear()
         for offset in range(start, self.order.numel(), self.batch_size):
-            yield self.order[offset : offset + self.batch_size].tolist()
+            indices = self.order[offset : offset + self.batch_size].tolist()
+            local = indices[self.rank :: self.world_size]
+            self.global_counts.append(len(indices))
+            self.local_counts.append(len(local))
+            yield local or [indices[0]]
 
     def __len__(self) -> int:
         remaining = max(self.order.numel() - self.start_sample, 0)
@@ -129,6 +154,7 @@ def train(
     seed: int = 0,
     dataset: Dataset | None = None,
     model: torch.nn.Module | None = None,
+    distributed_backend: str | None = None,
 ) -> dict[str, Any]:
     """Train and return final progress; dataset/model injection supports smoke tests."""
     if batch_size < 1 or workers < 0 or checkpoint_every < 1 or log_every < 1:
@@ -148,12 +174,31 @@ def train(
     random.seed(seed)
     np.random.seed(seed)
     selected_device = _select_device(device)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    if world_size > 1 and not dist.is_initialized():
+        backend = distributed_backend or (
+            "tpu_dist"
+            if selected_device.type == "tpu"
+            else "gloo"
+            if selected_device.type == "cpu"
+            else "nccl"
+        )
+        dist.init_process_group(backend=backend)
+    if selected_device.type == "cuda" and world_size > 1:
+        torch.cuda.set_device(local_rank)
+        selected_device = torch.device("cuda", local_rank)
     dataset = dataset if dataset is not None else HandwritingDataset(str(data))
     if len(dataset) == 0:
         raise RuntimeError("Training dataset is empty")
 
     model = model if model is not None else HandwritingModel()
     model = model.to(selected_device)
+    if world_size > 1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank] if selected_device.type == "cuda" else None
+        )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_path = Path(checkpoint) if checkpoint is not None else checkpoint_dir / "latest.pt"
@@ -162,7 +207,7 @@ def train(
     if resume is not None:
         resume_path = checkpoint_path if str(resume) == "latest" else Path(resume)
         state = _load_checkpoint(resume_path)
-        model.load_state_dict(state["model"])
+        _base_model(model).load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         global_step = int(state.get("global_step", state.get("step", 0)))
         saved_batch_size = int(state.get("batch_size", batch_size))
@@ -190,7 +235,7 @@ def train(
         _synchronize(selected_device)
         _atomic_save_checkpoint(
             {
-                "model": _to_cpu(model.state_dict()),
+                "model": _to_cpu(_base_model(model).state_dict()),
                 "optimizer": _to_cpu(optimizer.state_dict()),
                 "global_step": global_step,
                 "step": global_step,
@@ -209,7 +254,9 @@ def train(
     while (max_steps is None or global_step < max_steps) and (epochs is None or epoch < epochs):
         if hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch, seed)
-        batch_sampler = _EpochBatchSampler(len(dataset), batch_size, seed, epoch, samples_in_epoch)
+        batch_sampler = _EpochBatchSampler(
+            len(dataset), batch_size, seed, epoch, samples_in_epoch, rank, world_size
+        )
         if len(batch_sampler) == 0:
             epoch += 1
             batch_in_epoch = 0
@@ -221,17 +268,47 @@ def train(
             num_workers=workers,
             collate_fn=partial(
                 collate_handwriting,
-                pack_style=selected_device.type == "tpu" and isinstance(model, HandwritingModel),
+                pack_style=selected_device.type == "tpu"
+                and isinstance(_base_model(model), HandwritingModel),
             ),
             persistent_workers=False,
             generator=torch.Generator().manual_seed(seed + epoch),
         )
         log_started = time.perf_counter()
         last_logged_step = global_step
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
             batch = {name: value.to(selected_device) for name, value in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             loss, xy_loss, pen_loss = model(batch)
+            reported_loss, reported_xy_loss, reported_pen_loss = loss, xy_loss, pen_loss
+            if world_size > 1:
+                xy_count = batch["target_lengths"].sum().to(dtype=torch.float32)
+                pen_count = (batch["target_lengths"] + 1).sum().to(dtype=torch.float32)
+                if batch_sampler.local_counts[batch_index] == 0:
+                    xy_count.zero_()
+                    pen_count.zero_()
+                stats = torch.stack(
+                    (
+                        xy_loss.detach() * xy_count,
+                        pen_loss.detach() * pen_count,
+                        xy_count,
+                        pen_count,
+                    )
+                )
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                xy_count, pen_count = stats[2], stats[3]
+                loss = world_size * (
+                    xy_loss * batch["target_lengths"].sum() / xy_count.clamp_min(1)
+                    + 2.0
+                    * pen_loss
+                    * (batch["target_lengths"] + 1).sum()
+                    / pen_count.clamp_min(1)
+                )
+                if batch_sampler.local_counts[batch_index] == 0:
+                    loss = loss * 0.0
+                reported_xy_loss = stats[0] / xy_count.clamp_min(1)
+                reported_pen_loss = stats[1] / pen_count.clamp_min(1)
+                reported_loss = reported_xy_loss + 2.0 * reported_pen_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=1.0, error_if_nonfinite=True
@@ -239,7 +316,7 @@ def train(
             optimizer.step()
             global_step += 1
             batch_in_epoch += 1
-            samples_in_epoch += int(batch["target"].size(0))
+            samples_in_epoch += batch_sampler.global_counts[batch_index]
             if (
                 global_step % log_every == 0
                 or samples_in_epoch >= len(dataset)
@@ -248,15 +325,16 @@ def train(
                 _synchronize(selected_device)
                 elapsed = max(time.perf_counter() - log_started, 1e-9)
                 interval_steps = global_step - last_logged_step
-                print(
-                    f"Step {global_step}: loss={loss.item():.4f}, "
-                    f"xy={xy_loss.item():.4f}, pen={pen_loss.item():.4f}, "
-                    f"steps/s={interval_steps / elapsed:.2f}",
-                    flush=True,
-                )
+                if rank == 0:
+                    print(
+                        f"Step {global_step}: loss={reported_loss.item():.4f}, "
+                        f"xy={reported_xy_loss.item():.4f}, pen={reported_pen_loss.item():.4f}, "
+                        f"steps/s={interval_steps / elapsed:.2f}",
+                        flush=True,
+                    )
                 log_started = time.perf_counter()
                 last_logged_step = global_step
-            if global_step % checkpoint_every == 0:
+            if rank == 0 and global_step % checkpoint_every == 0:
                 save_progress()
             if max_steps is not None and global_step >= max_steps:
                 break
@@ -266,8 +344,11 @@ def train(
             batch_in_epoch = 0
             samples_in_epoch = 0
 
-    save_progress()
-    print(f"Saved checkpoint: {checkpoint_path}", flush=True)
+    if rank == 0:
+        save_progress()
+        print(f"Saved checkpoint: {checkpoint_path}", flush=True)
+    if world_size > 1:
+        dist.barrier()
     return {
         "global_step": global_step,
         "epoch": epoch,
@@ -297,6 +378,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--distributed-backend", choices=("gloo", "nccl", "tpu_dist"), default=None)
     args = parser.parse_args()
     if args.max_steps is None and args.epochs is None:
         args.max_steps = 10
@@ -316,6 +398,7 @@ def main() -> None:
             checkpoint_every=args.checkpoint_every,
             log_every=args.log_every,
             seed=args.seed,
+            distributed_backend=args.distributed_backend,
         )
     except (ValueError, RuntimeError, OSError) as error:
         parser.error(str(error))
